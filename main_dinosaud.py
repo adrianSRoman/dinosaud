@@ -95,7 +95,7 @@ def get_args_parser():
         help="""Scale range for local crops (fraction of total audio length).""")
 
     # Misc
-    parser.add_argument('--data_path', default='/path/to/audio/dataset.txt', type=str,
+    parser.add_argument('--data_path', default='/home/asroman/repos/SoundRain/dataset/splits/train_dataset.txt', type=str,
         help='Please specify path to the audio dataset list file.')
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
     parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
