@@ -15,7 +15,6 @@ import torch.nn as nn
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
-import librosa
 import random
 
 import utils
@@ -71,7 +70,7 @@ def get_args_parser():
         the end of training improves performance.""")
     parser.add_argument('--clip_grad', type=float, default=3.0, help="""Maximal parameter
         gradient norm if using gradient clipping. 0 for disabling.""")
-    parser.add_argument('--batch_size_per_gpu', default=64, type=int,
+    parser.add_argument('--batch_size_per_gpu', default=32, type=int,
         help='Per-GPU batch-size : number of distinct audio samples loaded on one GPU.')
     parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
     parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
@@ -95,7 +94,7 @@ def get_args_parser():
         help="""Scale range for local crops (fraction of total audio length).""")
 
     # Misc
-    parser.add_argument('--data_path', default='/home/asroman/repos/SoundRain/dataset/splits/train_dataset.txt', type=str,
+    parser.add_argument('--data_path', default='/scratch/data/repos/dinosaud/dataset/val.hdf5', type=str,
         help='Please specify path to the audio dataset list file.')
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
     parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
@@ -156,7 +155,7 @@ class AudioMultiCropWrapper(nn.Module):
     def forward(self, x):
         # x is a list of audio crops
         # Each crop shape: [batch_size, n_channels, sample_length]
-        
+
         if not isinstance(x, list):
             x = [x]
         
@@ -196,9 +195,7 @@ def train_dino(args):
         args.sample_rate
     )
     dataset = Dataset(
-        dataset=args.data_path,
-        sample_length=args.sample_length,
-        mode="train"
+        hdf5_path=args.data_path, transform=None
     )
     
     # Create wrapper dataset for transforms
@@ -262,7 +259,12 @@ def train_dino(args):
     else:
         # teacher_without_ddp and teacher are the same thing
         teacher_without_ddp = teacher
-    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
+    
+    student = nn.parallel.DistributedDataParallel(
+            student, 
+            device_ids=[args.gpu], 
+            find_unused_parameters=True
+    )
     
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict())
@@ -476,7 +478,6 @@ class AudioDatasetWrapper:
 
     def __getitem__(self, idx):
         mic_sig, foa_sig, filename = self.dataset[idx]
-        # Use mic_sig (4-channel) as input
         audio_crops = self.transform(mic_sig)
         return audio_crops, foa_sig, filename
 
@@ -495,14 +496,16 @@ class DataAugmentationAudioDINO:
         
         # Global crops
         for _ in range(2):
-            crop = self.random_crop(audio, self.global_crops_scale)
-            crop = self.apply_augmentations(crop)
+            crop = audio.astype(np.float32) # NOTE: for now no augmentation and make the data float32
+            #crop = self.random_crop(audio, self.global_crops_scale)
+            #crop = self.apply_augmentations(crop)
             crops.append(crop)
         
         # Local crops
         for _ in range(self.local_crops_number):
-            crop = self.random_crop(audio, self.local_crops_scale)
-            crop = self.apply_augmentations(crop)
+            crop = audio.astype(np.float32) # NOTE: for now no augmentation and make the data float32
+            #crop = self.random_crop(audio, self.local_crops_scale)
+            #crop = self.apply_augmentations(crop)
             crops.append(crop)
         
         return crops
@@ -540,7 +543,7 @@ class DataAugmentationAudioDINO:
 
     def apply_augmentations(self, audio):
         # audio: [n_channels, time_samples]
-        audio = torch.from_numpy(audio).float()
+        audio = torch.from_numpy(audio).to(torch.float32)
         
         # Time shifting
         if random.random() < 0.5:
