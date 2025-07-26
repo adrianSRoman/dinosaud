@@ -259,7 +259,12 @@ def train_dino(args):
     else:
         # teacher_without_ddp and teacher are the same thing
         teacher_without_ddp = teacher
-    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
+    
+    student = nn.parallel.DistributedDataParallel(
+            student, 
+            device_ids=[args.gpu], 
+            find_unused_parameters=True
+    )
     
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict())
