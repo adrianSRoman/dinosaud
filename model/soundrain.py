@@ -122,7 +122,7 @@ class SoundRain(nn.Module):
             kmeans_iters=100,
             threshold_ema_dead_code=2
         )
-        self.decoder = Decoder(C=C, D=D, strides=strides)
+        # self.decoder = Decoder(C=C, D=D, strides=strides)
 
     def forward(
             self,

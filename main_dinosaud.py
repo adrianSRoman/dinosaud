@@ -19,8 +19,7 @@ import random
 
 import utils
 from model.soundrain import SoundRain
-from dataset.dataloader import Dataset
-from util.utils import sample_fixed_length_data_aligned
+from dataset.dataloader import SpatialAudioDataset
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Audio DINO', add_help=False)
@@ -55,9 +54,17 @@ def get_args_parser():
         help='Number of warmup epochs for the teacher temperature (Default: 30).')
 
     # Audio parameters
-    parser.add_argument('--sample_rate', default=16000, type=int, help='Audio sample rate')
-    parser.add_argument('--sample_length', default=16384, type=int, help='Fixed length for audio samples')
-    parser.add_argument('--n_channels', default=4, type=int, help='Number of audio channels')
+    parser.add_argument('--sample_rate', default=44100, type=int, help='Audio sample rate')
+    parser.add_argument('--audio_length_seconds', default=5, type=int, help='Audio length in seconds')
+    parser.add_argument('--reverb_type', default='binaural', type=str, choices=['binaural', 'mic', 'mono'],
+        help='Type of reverb/spatial audio')
+
+    # Dataset parameters
+    parser.add_argument('--audio_json', default="/scratch/data/repos/dinosaud/train_metadata/audio_metadata.json", type=str, help='Path to audio metadata JSON')
+    parser.add_argument('--reverb_json', default="/scratch/data/repos/dinosaud/train_metadata/metadata.json", type=str, help='Path to reverb groups JSON')
+    parser.add_argument('--audio_path_root', default="/scratch/ssd1/audio_datasets/AudioSet_DCASE", type=str, help='Root path for audio files')
+    parser.add_argument('--reverb_path_root', default="/scratch/ssd1/DINOSAUD_Dataset", type=str, help='Root path for reverb files')
+    parser.add_argument('--normalize', default=True, type=utils.bool_flag, help='Normalize audio')
 
     # Training/Optimization parameters
     parser.add_argument('--use_fp16', type=utils.bool_flag, default=True, help="""Whether or not
@@ -70,7 +77,7 @@ def get_args_parser():
         the end of training improves performance.""")
     parser.add_argument('--clip_grad', type=float, default=3.0, help="""Maximal parameter
         gradient norm if using gradient clipping. 0 for disabling.""")
-    parser.add_argument('--batch_size_per_gpu', default=32, type=int,
+    parser.add_argument('--batch_size_per_gpu', default=8, type=int,
         help='Per-GPU batch-size : number of distinct audio samples loaded on one GPU.')
     parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
     parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
@@ -83,19 +90,8 @@ def get_args_parser():
         end of optimization. We use a cosine LR schedule with linear warmup.""")
     parser.add_argument('--optimizer', default='adamw', type=str,
         choices=['adamw', 'sgd', 'lars'], help="""Type of optimizer.""")
-    parser.add_argument('--drop_path_rate', type=float, default=0.1, help="stochastic depth rate")
-
-    # Multi-crop parameters for audio
-    parser.add_argument('--global_crops_scale', type=float, nargs='+', default=(0.4, 1.),
-        help="""Scale range for global crops (fraction of total audio length).""")
-    parser.add_argument('--local_crops_number', type=int, default=8, help="""Number of small
-        local crops to generate. Set to 0 to disable multi-crop training.""")
-    parser.add_argument('--local_crops_scale', type=float, nargs='+', default=(0.05, 0.4),
-        help="""Scale range for local crops (fraction of total audio length).""")
 
     # Misc
-    parser.add_argument('--data_path', default='/scratch/data/repos/dinosaud/dataset/val.hdf5', type=str,
-        help='Please specify path to the audio dataset list file.')
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
     parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
@@ -143,40 +139,31 @@ class AudioDINOHead(nn.Module):
         return x
 
 
-class AudioMultiCropWrapper(nn.Module):
+class SpatialAudioWrapper(nn.Module):
     """
-    Wrapper for audio multi-crop processing
+    Wrapper for spatial audio processing with teacher/student paradigm
     """
     def __init__(self, backbone, head):
-        super(AudioMultiCropWrapper, self).__init__()
+        super(SpatialAudioWrapper, self).__init__()
         self.backbone = backbone
         self.head = head
 
-    def forward(self, x):
-        # x is a list of audio crops
-        # Each crop shape: [batch_size, n_channels, sample_length]
-
-        if not isinstance(x, list):
-            x = [x]
+    def forward(self, audio_tensor, is_teacher=False):
+        """
+        Args:
+            audio_tensor: [batch_size * num_crops, channels, time]
+            is_teacher: bool indicating if this is teacher or student
+        """
+        # Process audio through backbone
+        features = self.backbone(audio_tensor, mode='encode')
         
-        idx_crops = torch.cumsum(torch.unique_consecutive(
-            torch.tensor([inp.shape[-1] for inp in x]),
-            return_counts=True,
-        )[1], 0)
-        start_idx = 0
-        for end_idx in idx_crops:
-            # Process crops of the same size together
-            _out = self.backbone(torch.cat(x[start_idx: end_idx]), mode='encode')
-            # Global average pooling over time dimension
-            _out = torch.mean(_out, dim=1)  # [batch_size, D]
-            if start_idx == 0:
-                output = _out
-            else:
-                output = torch.cat((output, _out))
-            start_idx = end_idx
+        # Global average pooling over time dimension
+        features = torch.mean(features, dim=1)  # [batch_size * num_crops, D]
         
         # Apply projection head
-        return self.head(output)
+        output = self.head(features)
+        
+        return output
 
 
 def train_dino(args):
@@ -187,19 +174,17 @@ def train_dino(args):
     cudnn.benchmark = True
 
     # ============ preparing data ... ============
-    transform = DataAugmentationAudioDINO(
-        args.global_crops_scale,
-        args.local_crops_scale,
-        args.local_crops_number,
-        args.sample_length,
-        args.sample_rate
+    dataset = SpatialAudioDataset(
+        audio_json=args.audio_json,
+        reverb_json=args.reverb_json,
+        audio_path_root=args.audio_path_root,
+        reverb_path_root=args.reverb_path_root,
+        reverb_type=args.reverb_type,
+        sample_rate=args.sample_rate,
+        audio_length_seconds=args.audio_length_seconds,
+        normalize=args.normalize,
+        mode="train"
     )
-    dataset = Dataset(
-        hdf5_path=args.data_path, transform=None
-    )
-    
-    # Create wrapper dataset for transforms
-    dataset = AudioDatasetWrapper(dataset, transform)
     
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
@@ -209,6 +194,7 @@ def train_dino(args):
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
+        collate_fn=dataset.collate_fn
     )
     print(f"Data loaded: there are {len(dataset)} audio samples.")
 
@@ -232,14 +218,14 @@ def train_dino(args):
     else:
         raise ValueError(f"Unknown backbone: {args.backbone}")
 
-    # Wrap with multi-crop processing and DINO head
-    student = AudioMultiCropWrapper(student_backbone, AudioDINOHead(
+    # Wrap with spatial audio processing and DINO head
+    student = SpatialAudioWrapper(student_backbone, AudioDINOHead(
         embed_dim,
         args.out_dim,
         use_bn=args.use_bn_in_head,
         norm_last_layer=args.norm_last_layer,
     ))
-    teacher = AudioMultiCropWrapper(teacher_backbone, AudioDINOHead(
+    teacher = SpatialAudioWrapper(teacher_backbone, AudioDINOHead(
         embed_dim,
         args.out_dim,
         use_bn=args.use_bn_in_head
@@ -276,7 +262,7 @@ def train_dino(args):
     # ============ preparing loss ... ============
     dino_loss = DINOLoss(
         args.out_dim,
-        args.local_crops_number + 2,  # total number of crops = 2 global crops + local_crops_number
+        6,  # 2 teacher crops + 4 student crops
         args.warmup_teacher_temp,
         args.teacher_temp,
         args.warmup_teacher_temp_epochs,
@@ -327,7 +313,7 @@ def train_dino(args):
     start_epoch = to_restore["epoch"]
 
     start_time = time.time()
-    print("Starting Audio DINO training !")
+    print("Starting Spatial Audio DINO training !")
     for epoch in range(start_epoch, args.epochs):
         data_loader.sampler.set_epoch(epoch)
 
@@ -365,7 +351,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
                     fp16_scaler, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
-    for it, (audio_crops, _, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    
+    for it, batch in enumerate(metric_logger.log_every(data_loader, 10, header)):
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
@@ -373,13 +360,16 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
             if i == 0:  # only the first group is regularized
                 param_group["weight_decay"] = wd_schedule[it]
 
-        # move audio crops to gpu
-        audio_crops = [crop.cuda(non_blocking=True) for crop in audio_crops]
+        # Extract teacher and student audio
+        teacher_audio = batch['teacher_audio'].cuda(non_blocking=True)  # [batch_size*2, channels, time]
+        student_audio = batch['student_audio'].cuda(non_blocking=True)  # [batch_size*4, channels, time]
         
         # teacher and student forward passes + compute dino loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
-            teacher_output = teacher(audio_crops[:2])  # only the 2 global crops pass through the teacher
-            student_output = student(audio_crops)
+            # print("Input shapes - Teacher: {}, Student: {}".format(
+            #     teacher_audio.shape, student_audio.shape))
+            teacher_output = teacher(teacher_audio, is_teacher=True)  # Teacher processes 2 crops per sample
+            student_output = student(student_audio, is_teacher=False)  # Student processes 4 crops per sample
             loss = dino_loss(student_output, teacher_output, epoch)
 
         if not math.isfinite(loss.item()):
@@ -440,19 +430,31 @@ class DINOLoss(nn.Module):
         ))
 
     def forward(self, student_output, teacher_output, epoch):
+        """
+        Cross-entropy between softmax outputs of the teacher and student networks.
+        
+        Args:
+            student_output: [batch_size*4, out_dim] - 4 crops per sample  
+            teacher_output: [batch_size*2, out_dim] - 2 crops per sample
+        """
         student_out = student_output / self.student_temp
-        student_out = student_out.chunk(self.ncrops)
+        # Reshape student output: [batch_size*4, out_dim] -> 4 chunks of [batch_size, out_dim]
+        batch_size = teacher_output.shape[0] // 2
+        student_out = student_out.view(batch_size, 4, -1)  # [batch_size, 4, out_dim]
+        student_out = [student_out[:, i] for i in range(4)]  # List of 4 tensors
 
         temp = self.teacher_temp_schedule[epoch]
         teacher_out = F.softmax((teacher_output - self.center) / temp, dim=-1)
-        teacher_out = teacher_out.detach().chunk(2)
+        # Reshape teacher output: [batch_size*2, out_dim] -> 2 chunks of [batch_size, out_dim]
+        teacher_out = teacher_out.view(batch_size, 2, -1)  # [batch_size, 2, out_dim]
+        teacher_out = teacher_out.detach()
+        teacher_out = [teacher_out[:, i] for i in range(2)]  # List of 2 tensors
 
         total_loss = 0
         n_loss_terms = 0
         for iq, q in enumerate(teacher_out):
             for v in range(len(student_out)):
-                if v == iq:
-                    continue
+                # Each teacher crop should predict all student crops
                 loss = torch.sum(-q * F.log_softmax(student_out[v], dim=-1), dim=-1)
                 total_loss += loss.mean()
                 n_loss_terms += 1
@@ -466,104 +468,6 @@ class DINOLoss(nn.Module):
         dist.all_reduce(batch_center)
         batch_center = batch_center / (len(teacher_output) * dist.get_world_size())
         self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
-
-
-class AudioDatasetWrapper:
-    def __init__(self, dataset, transform):
-        self.dataset = dataset
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        mic_sig, foa_sig, filename = self.dataset[idx]
-        audio_crops = self.transform(mic_sig)
-        return audio_crops, foa_sig, filename
-
-
-class DataAugmentationAudioDINO:
-    def __init__(self, global_crops_scale, local_crops_scale, local_crops_number, sample_length, sample_rate):
-        self.global_crops_scale = global_crops_scale
-        self.local_crops_scale = local_crops_scale
-        self.local_crops_number = local_crops_number
-        self.sample_length = sample_length
-        self.sample_rate = sample_rate
-
-    def __call__(self, audio):
-        # audio: [n_channels, time_samples]
-        crops = []
-        
-        # Global crops
-        for _ in range(2):
-            crop = audio.astype(np.float32) # NOTE: for now no augmentation and make the data float32
-            #crop = self.random_crop(audio, self.global_crops_scale)
-            #crop = self.apply_augmentations(crop)
-            crops.append(crop)
-        
-        # Local crops
-        for _ in range(self.local_crops_number):
-            crop = audio.astype(np.float32) # NOTE: for now no augmentation and make the data float32
-            #crop = self.random_crop(audio, self.local_crops_scale)
-            #crop = self.apply_augmentations(crop)
-            crops.append(crop)
-        
-        return crops
-
-    def random_crop(self, audio, scale_range):
-        # audio: [n_channels, time_samples]
-        n_channels, total_samples = audio.shape
-        
-        # Determine crop length
-        min_scale, max_scale = scale_range
-        scale = random.uniform(min_scale, max_scale)
-        crop_length = int(total_samples * scale)
-        crop_length = max(crop_length, 1024)  # Minimum crop length
-        
-        # Random start position
-        if crop_length >= total_samples:
-            start_pos = 0
-            crop_length = total_samples
-        else:
-            start_pos = random.randint(0, total_samples - crop_length)
-        
-        # Extract crop
-        crop = audio[:, start_pos:start_pos + crop_length]
-        
-        # Pad or trim to fixed length for consistent processing
-        if crop_length < self.sample_length:
-            # Pad with zeros
-            pad_length = self.sample_length - crop_length
-            crop = F.pad(crop, (0, pad_length), mode='constant', value=0)
-        elif crop_length > self.sample_length:
-            # Trim to sample_length
-            crop = crop[:, :self.sample_length]
-        
-        return crop
-
-    def apply_augmentations(self, audio):
-        # audio: [n_channels, time_samples]
-        audio = torch.from_numpy(audio).to(torch.float32)
-        
-        # Time shifting
-        if random.random() < 0.5:
-            shift = random.randint(-audio.shape[1]//10, audio.shape[1]//10)
-            audio = torch.roll(audio, shift, dims=1)
-        
-        # Amplitude scaling
-        if random.random() < 0.8:
-            scale = random.uniform(0.8, 1.2)
-            audio = audio * scale
-        
-        # Add noise
-        if random.random() < 0.3:
-            noise = torch.randn_like(audio) * 0.01
-            audio = audio + noise
-        
-        # Normalize
-        audio = audio / (torch.max(torch.abs(audio)) + 1e-8)
-        
-        return audio
 
 
 if __name__ == '__main__':
