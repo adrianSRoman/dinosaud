@@ -109,9 +109,9 @@ def create_audio_json(audio_root, output_path, file_extension=".wav", split="tra
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Create audio metadata JSON from AudioSet_DCASE directory structure')
     parser.add_argument('--audio_root', type=str, default="/scratch/ssd1/audio_datasets/AudioSet_DCASE", help='Root directory of AudioSet_DCASE')
-    parser.add_argument('--output_path', type=str, default="/scratch/data/repos/dinosaud/train_metadata/audio_metadata.json", help='Path to save the output JSON file')
+    parser.add_argument('--output_path', type=str, default="/scratch/data/repos/dinosaud/test_metadata/audio_metadata.json", help='Path to save the output JSON file')
     parser.add_argument('--file_extension', type=str, default='.wav', help='Audio file extension to look for')
-    parser.add_argument('--split', type=str, choices=['train', 'val', 'test'], default='train', help='Which split to process')
+    parser.add_argument('--split', type=str, choices=['train', 'val', 'test'], default='test', help='Which split to process')
     
     args = parser.parse_args()
     
