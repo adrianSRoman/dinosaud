@@ -30,6 +30,8 @@ class SpatialAudioDataset(Dataset):
         reverb_type='mic',
         sample_rate=44100,
         audio_length_seconds=5,
+        teacher_num=2,
+        student_num=4,
         normalize=True,
         _ext_audio=".wav",
         mode="train"
@@ -52,12 +54,20 @@ class SpatialAudioDataset(Dataset):
         self.normalize = normalize
         self._ext_audio = _ext_audio
         self.mode = mode
+        self.teacher_num = teacher_num # number of augmentations for teacher
+        self.student_num = student_num # number of augmentations for student
         
         # Determine number of channels based on reverb type
         self.channel_num = 2 if reverb_type == 'binaural' else 4 if reverb_type == 'mic' else 1
         
         # Convert groups dict to list for easier sampling
         self.group_list = list(self.reverb_groups.values())
+
+        # Filter groups to only include those with at least 6 reverbs
+        self.group_list = [group for group in self.group_list if len(group['rooms']) >= (self.teacher_num + self.student_num)]
+        
+        if not self.group_list:
+            raise ValueError("No groups have at least 6 reverbs")
         
         print(f'---------------the {mode} dataloader---------------')
         print(f'Audio samples: {len(self.audio_data)}')
@@ -146,9 +156,13 @@ class SpatialAudioDataset(Dataset):
             "elevation": elevation_class
         }
 
-    def sample_reverbs_from_group(self, group, num_reverbs):
-        """Sample reverbs from a group"""
+    def sample_reverbs_from_group(self, group, num_reverbs, exclude=None):
+        """Sample reverbs from a group, optionally excluding certain reverbs"""
         available_reverbs = group['rooms']
+        
+        if exclude: # ensure if we sample again, we get disjoint reverbs
+            available_reverbs = [r for r in available_reverbs if r not in exclude]
+        
         if len(available_reverbs) < num_reverbs:
             # If not enough reverbs, sample with replacement
             return random.choices(available_reverbs, k=num_reverbs)
@@ -158,20 +172,23 @@ class SpatialAudioDataset(Dataset):
     def __getitem__(self, index):
         """
         Returns:
-            dict: Contains 'teacher_data' and 'student_data' with reverbs and spatial targets
+        dict: Contains 'teacher_data' and 'student_data' with reverbs and spatial targets
         """
         # Get audio item
         audio_item = self.audio_data[index]
-        
         # Load base audio
         base_audio = self.load_audio(audio_item)
         
         # Sample a random group for this audio sample
         selected_group = random.choice(self.group_list)
         
-        # Sample reverbs for teacher (2 reverbs) and student (4 reverbs)
-        teacher_reverbs_meta = self.sample_reverbs_from_group(selected_group, 2)
-        student_reverbs_meta = self.sample_reverbs_from_group(selected_group, 4)
+        # Sample teacher reverbs first
+        teacher_reverbs_meta = self.sample_reverbs_from_group(selected_group, self.teacher_num)
+        
+        # Sample student reverbs, excluding teacher reverbs
+        student_reverbs_meta = self.sample_reverbs_from_group(
+            selected_group, self.student_num, exclude=teacher_reverbs_meta
+        )
         
         # Load teacher reverbs and create convolved audio
         teacher_reverbs = []

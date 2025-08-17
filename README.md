@@ -20,3 +20,20 @@ python main_dinosaud.py \
     --sample_rate 44100 \
     --audio_length_seconds 1
 ```
+
+
+## Extract features KNN
+```
+python eval_knn_spatial.py \
+    --extract_features \
+    --batch_size_per_gpu 16 \
+    --reverb_type mic
+```
+
+```
+python eval_knn_spatial.py \
+    --run_knn \
+    --features_dir /path/to/features \
+    --nb_knn 10 20 50 100 \
+    --temperature 0.07
+```
