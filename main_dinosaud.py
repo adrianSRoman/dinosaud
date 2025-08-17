@@ -63,7 +63,7 @@ def get_args_parser():
     parser.add_argument('--audio_json', default="/scratch/data/repos/dinosaud/train_metadata/audio_metadata.json", type=str, help='Path to audio metadata JSON')
     parser.add_argument('--reverb_json', default="/scratch/data/repos/dinosaud/train_metadata/metadata.json", type=str, help='Path to reverb groups JSON')
     parser.add_argument('--audio_path_root', default="/scratch/ssd1/audio_datasets/AudioSet_DCASE", type=str, help='Root path for audio files')
-    parser.add_argument('--reverb_path_root', default="/scratch/ssd1/DINOSAUD_Dataset", type=str, help='Root path for reverb files')
+    parser.add_argument('--reverb_path_root', default="/scratch/ssd1/DINOSAUD_Dataset_Discrete", type=str, help='Root path for reverb files')
     parser.add_argument('--normalize', default=True, type=utils.bool_flag, help='Normalize audio')
 
     # Training/Optimization parameters
